@@ -92,6 +92,18 @@ class FmlTokenizer(private val input: String) {
                 }
                 return Token(TokenType.COMMENT, input.substring(start, position), startLine, startColumn)
             }
+            if (peek() == '*') {
+                // Block comment
+                advance()
+                while (!isAtEnd() && !(peek() == '*' && position + 1 < input.length && input[position + 1] == '/')) {
+                    advance()
+                }
+                if (!isAtEnd()) {
+                    advance() // '*'
+                    advance() // '/'
+                }
+                return Token(TokenType.COMMENT, input.substring(start, position), startLine, startColumn)
+            }
         }
 
         // Handle strings
@@ -228,26 +240,43 @@ class FmlParser(private val tokens: List<Token>) {
     private fun parseStructureMap(): StructureMap {
         // Expect "map"
         if (!match(TokenType.MAP)) {
-            throw IllegalArgumentException("Expected 'map' keyword at start of StructureMap")
+            throw IllegalArgumentException(err("Expected 'map' keyword at start of StructureMap"))
         }
 
         // Parse URL
         val url = if (peek().type == TokenType.STRING) {
             advance().value
         } else {
-            throw IllegalArgumentException("Expected URL string after 'map'")
+            throw IllegalArgumentException(err("Expected URL string after 'map'"))
         }
 
         // Parse "="
         if (!match(TokenType.EQUALS)) {
-            throw IllegalArgumentException("Expected '=' after URL")
+            throw IllegalArgumentException(err("Expected '=' after URL"))
         }
 
         // Parse name
         val name = if (peek().type == TokenType.STRING) {
             advance().value
         } else {
-            throw IllegalArgumentException("Expected name string after '='")
+            throw IllegalArgumentException(err("Expected name string after '='"))
+        }
+
+        // Parse header declarations: uses ... / imports ...
+        val structures = mutableListOf<StructureMapStructure>()
+        val imports = mutableListOf<String>()
+        while (true) {
+            when (peek().type) {
+                TokenType.USES -> structures.add(parseUses())
+                TokenType.IMPORTS -> {
+                    advance()
+                    if (peek().type != TokenType.STRING) {
+                        throw IllegalArgumentException(err("Expected URL string after 'imports'"))
+                    }
+                    imports.add(advance().value)
+                }
+                else -> break
+            }
         }
 
         // Parse groups
@@ -257,30 +286,70 @@ class FmlParser(private val tokens: List<Token>) {
         }
 
         if (groups.isEmpty()) {
-            throw IllegalArgumentException("StructureMap must have at least one group")
+            throw IllegalArgumentException(err("StructureMap must have at least one group"))
         }
 
         return StructureMap(
             url = url,
             name = name,
             status = StructureMapStatus.ACTIVE,
+            structure = structures.ifEmpty { null },
+            import = imports.ifEmpty { null },
             group = groups
         )
     }
 
+    // uses "url" [alias Name] as source|queried|target|produced
+    private fun parseUses(): StructureMapStructure {
+        advance() // 'uses'
+        if (peek().type != TokenType.STRING) {
+            throw IllegalArgumentException(err("Expected URL string after 'uses'"))
+        }
+        val url = advance().value
+        var alias: String? = null
+        if (peek().type == TokenType.ALIAS) {
+            advance()
+            if (peek().type != TokenType.IDENTIFIER) {
+                throw IllegalArgumentException(err("Expected alias name after 'alias'"))
+            }
+            alias = advance().value
+        }
+        if (peek().type != TokenType.AS) {
+            throw IllegalArgumentException(err("Expected 'as' in uses declaration"))
+        }
+        advance()
+        if (peek().type != TokenType.IDENTIFIER) {
+            throw IllegalArgumentException(err("Expected model mode after 'as'"))
+        }
+        val modeStr = advance().value
+        val mode = when (modeStr.lowercase()) {
+            "source" -> StructureMapModelMode.SOURCE
+            "queried" -> StructureMapModelMode.QUERIED
+            "target" -> StructureMapModelMode.TARGET
+            "produced" -> StructureMapModelMode.PRODUCED
+            else -> throw IllegalArgumentException(err("Invalid model mode: $modeStr"))
+        }
+        return StructureMapStructure(url = url, mode = mode, alias = alias)
+    }
+
+    private fun err(message: String): String {
+        val t = peek()
+        return "$message (line ${t.line}, near '${t.value.take(20)}')"
+    }
+
     private fun parseGroup(): StructureMapGroup {
         if (!match(TokenType.GROUP)) {
-            throw IllegalArgumentException("Expected 'group' keyword")
+            throw IllegalArgumentException(err("Expected 'group' keyword"))
         }
 
         val name = if (peek().type == TokenType.IDENTIFIER) {
             advance().value
         } else {
-            throw IllegalArgumentException("Expected group name")
+            throw IllegalArgumentException(err("Expected group name"))
         }
 
         if (!match(TokenType.LPAREN)) {
-            throw IllegalArgumentException("Expected '(' after group name")
+            throw IllegalArgumentException(err("Expected '(' after group name"))
         }
 
         // Parse inputs
@@ -289,17 +358,17 @@ class FmlParser(private val tokens: List<Token>) {
             inputs.add(parseInput())
             if (!check(TokenType.RPAREN)) {
                 if (!match(TokenType.COMMA)) {
-                    throw IllegalArgumentException("Expected ',' between inputs")
+                    throw IllegalArgumentException(err("Expected ',' between inputs"))
                 }
             }
         }
 
         if (!match(TokenType.RPAREN)) {
-            throw IllegalArgumentException("Expected ')' after inputs")
+            throw IllegalArgumentException(err("Expected ')' after inputs"))
         }
 
         if (!match(TokenType.LBRACE)) {
-            throw IllegalArgumentException("Expected '{' to start group body")
+            throw IllegalArgumentException(err("Expected '{' to start group body"))
         }
 
         // Parse rules
@@ -309,7 +378,7 @@ class FmlParser(private val tokens: List<Token>) {
         }
 
         if (!match(TokenType.RBRACE)) {
-            throw IllegalArgumentException("Expected '}' to end group body")
+            throw IllegalArgumentException(err("Expected '}' to end group body"))
         }
 
         return StructureMapGroup(
@@ -326,20 +395,31 @@ class FmlParser(private val tokens: List<Token>) {
                 when (modeStr.lowercase()) {
                     "source" -> InputMode.SOURCE
                     "target" -> InputMode.TARGET
-                    else -> throw IllegalArgumentException("Invalid input mode: $modeStr")
+                    else -> throw IllegalArgumentException(err("Invalid input mode: $modeStr"))
                 }
             }
-            else -> throw IllegalArgumentException("Expected input mode (source/target)")
+            else -> throw IllegalArgumentException(err("Expected input mode (source/target)"))
         }
 
         val name = if (peek().type == TokenType.IDENTIFIER) {
             advance().value
         } else {
-            throw IllegalArgumentException("Expected input name")
+            throw IllegalArgumentException(err("Expected input name"))
+        }
+
+        // Optional type: `source qr : QResp`
+        var type: String? = null
+        if (match(TokenType.COLON)) {
+            type = if (peek().type == TokenType.IDENTIFIER) {
+                advance().value
+            } else {
+                throw IllegalArgumentException(err("Expected input type after ':'"))
+            }
         }
 
         return StructureMapGroupInput(
             name = name,
+            type = type,
             mode = mode
         )
     }
@@ -352,7 +432,7 @@ class FmlParser(private val tokens: List<Token>) {
 
         // Expect arrow
         if (!match(TokenType.ARROW)) {
-            throw IllegalArgumentException("Expected '->' in rule")
+            throw IllegalArgumentException(err("Expected '->' in rule"))
         }
 
         // Parse targets
@@ -361,7 +441,7 @@ class FmlParser(private val tokens: List<Token>) {
 
         // Expect semicolon
         if (!match(TokenType.SEMICOLON)) {
-            throw IllegalArgumentException("Expected ';' to end rule")
+            throw IllegalArgumentException(err("Expected ';' to end rule"))
         }
 
         return StructureMapGroupRule(
@@ -374,7 +454,7 @@ class FmlParser(private val tokens: List<Token>) {
         val context = if (peek().type == TokenType.IDENTIFIER) {
             advance().value
         } else {
-            throw IllegalArgumentException("Expected source context")
+            throw IllegalArgumentException(err("Expected source context"))
         }
 
         var element: String? = null
@@ -382,7 +462,7 @@ class FmlParser(private val tokens: List<Token>) {
             element = if (peek().type == TokenType.IDENTIFIER) {
                 advance().value
             } else {
-                throw IllegalArgumentException("Expected element name after '.'")
+                throw IllegalArgumentException(err("Expected element name after '.'"))
             }
         }
 
@@ -396,7 +476,7 @@ class FmlParser(private val tokens: List<Token>) {
         val context = if (peek().type == TokenType.IDENTIFIER) {
             advance().value
         } else {
-            throw IllegalArgumentException("Expected target context")
+            throw IllegalArgumentException(err("Expected target context"))
         }
 
         var element: String? = null
@@ -404,7 +484,7 @@ class FmlParser(private val tokens: List<Token>) {
             element = if (peek().type == TokenType.IDENTIFIER) {
                 advance().value
             } else {
-                throw IllegalArgumentException("Expected element name after '.'")
+                throw IllegalArgumentException(err("Expected element name after '.'"))
             }
         }
 

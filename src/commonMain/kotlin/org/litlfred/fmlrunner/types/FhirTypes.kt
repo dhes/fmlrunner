@@ -15,8 +15,23 @@ data class StructureMap(
     val status: StructureMapStatus,
     val experimental: Boolean? = null,
     val description: String? = null,
+    val structure: List<StructureMapStructure>? = null,
+    val import: List<String>? = null,
     val group: List<StructureMapGroup>
 )
+
+@Serializable
+data class StructureMapStructure(
+    val url: String,
+    val mode: StructureMapModelMode,
+    val alias: String? = null,
+    val documentation: String? = null
+)
+
+@Serializable
+enum class StructureMapModelMode {
+    SOURCE, QUERIED, TARGET, PRODUCED
+}
 
 @Serializable
 enum class StructureMapStatus {
