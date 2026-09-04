@@ -425,74 +425,247 @@ class FmlParser(private val tokens: List<Token>) {
     }
 
     private fun parseRule(): StructureMapGroupRule {
-        val sources = mutableListOf<StructureMapGroupRuleSource>()
-        
-        // Parse source
-        sources.add(parseRuleSource())
+        val sources = mutableListOf(parseRuleSource())
+        while (match(TokenType.COMMA)) sources.add(parseRuleSource())
 
-        // Expect arrow
-        if (!match(TokenType.ARROW)) {
-            throw IllegalArgumentException(err("Expected '->' in rule"))
+        var targets: MutableList<StructureMapGroupRuleTarget>? = null
+        if (match(TokenType.ARROW)) {
+            targets = mutableListOf(parseRuleTarget())
+            while (match(TokenType.COMMA)) targets.add(parseRuleTarget())
         }
 
-        // Parse targets
-        val targets = mutableListOf<StructureMapGroupRuleTarget>()
-        targets.add(parseRuleTarget())
+        var nested: MutableList<StructureMapGroupRule>? = null
+        var dependents: MutableList<StructureMapGroupRuleDependent>? = null
+        if (peek().type == TokenType.IDENTIFIER && peek().value == "then") {
+            advance()
+            if (match(TokenType.LBRACE)) {
+                nested = mutableListOf()
+                while (!check(TokenType.RBRACE) && !isAtEnd()) {
+                    nested.add(parseRule())
+                }
+                if (!match(TokenType.RBRACE)) {
+                    throw IllegalArgumentException(err("Expected '}' to end nested rules"))
+                }
+            } else {
+                dependents = mutableListOf(parseDependent())
+                while (match(TokenType.COMMA)) dependents.add(parseDependent())
+            }
+        }
 
-        // Expect semicolon
+        var name: String? = null
+        if (peek().type == TokenType.STRING) {
+            name = advance().value
+        }
+
         if (!match(TokenType.SEMICOLON)) {
             throw IllegalArgumentException(err("Expected ';' to end rule"))
         }
 
         return StructureMapGroupRule(
+            name = name,
             source = sources,
-            target = targets
+            target = targets,
+            rule = nested,
+            dependent = dependents
         )
     }
 
-    private fun parseRuleSource(): StructureMapGroupRuleSource {
-        val context = if (peek().type == TokenType.IDENTIFIER) {
-            advance().value
-        } else {
-            throw IllegalArgumentException(err("Expected source context"))
+    private fun parseDependent(): StructureMapGroupRuleDependent {
+        val name = expectIdentifier("dependent group name")
+        if (!match(TokenType.LPAREN)) {
+            throw IllegalArgumentException(err("Expected '(' after dependent group name"))
         }
-
-        var element: String? = null
-        if (match(TokenType.DOT)) {
-            element = if (peek().type == TokenType.IDENTIFIER) {
-                advance().value
-            } else {
-                throw IllegalArgumentException(err("Expected element name after '.'"))
+        val variables = mutableListOf<String>()
+        while (!check(TokenType.RPAREN)) {
+            variables.add(expectIdentifier("dependent variable"))
+            if (!check(TokenType.RPAREN) && !match(TokenType.COMMA)) {
+                throw IllegalArgumentException(err("Expected ',' between dependent variables"))
             }
         }
+        advance() // ')'
+        return StructureMapGroupRuleDependent(name = name, variable = variables)
+    }
 
+    private fun parseRuleSource(): StructureMapGroupRuleSource {
+        val context = expectIdentifier("source context")
+        var element: String? = null
+        if (match(TokenType.DOT)) {
+            element = expectIdentifier("element name after '.'")
+        }
+        var listMode: String? = null
+        var variable: String? = null
+        var condition: String? = null
+        var checkExpr: String? = null
+        loop@ while (true) {
+            val t = peek()
+            when {
+                t.type == TokenType.IDENTIFIER && t.value in LIST_MODES && listMode == null ->
+                    listMode = advance().value
+                t.type == TokenType.AS -> {
+                    advance()
+                    variable = expectIdentifier("variable name after 'as'")
+                }
+                t.type == TokenType.WHERE -> {
+                    advance()
+                    condition = captureExpression()
+                }
+                t.type == TokenType.CHECK -> {
+                    advance()
+                    checkExpr = captureExpression()
+                }
+                else -> break@loop
+            }
+        }
         return StructureMapGroupRuleSource(
             context = context,
-            element = element
+            element = element,
+            variable = variable,
+            listMode = listMode,
+            condition = condition,
+            check = checkExpr
         )
     }
 
     private fun parseRuleTarget(): StructureMapGroupRuleTarget {
-        val context = if (peek().type == TokenType.IDENTIFIER) {
-            advance().value
-        } else {
-            throw IllegalArgumentException(err("Expected target context"))
+        // Invocation form: create("...") as model, uuid() as pid, c(system, code)
+        if (peek().type == TokenType.IDENTIFIER && peekNext().type == TokenType.LPAREN) {
+            val fn = advance().value
+            val params = parseTransformParams()
+            var variable: String? = null
+            if (peek().type == TokenType.AS) {
+                advance()
+                variable = expectIdentifier("variable name after 'as'")
+            }
+            return StructureMapGroupRuleTarget(
+                variable = variable,
+                transform = fn,
+                parameter = params.ifEmpty { null }
+            )
         }
 
+        // Context form: ctx('.' element)? ('=' transform)? ('as' var)?
+        val context = expectIdentifier("target context")
         var element: String? = null
         if (match(TokenType.DOT)) {
-            element = if (peek().type == TokenType.IDENTIFIER) {
-                advance().value
-            } else {
-                throw IllegalArgumentException(err("Expected element name after '.'"))
+            element = expectIdentifier("element name after '.'")
+        }
+        var transform: String? = null
+        var parameter: List<TransformParameter>? = null
+        if (match(TokenType.EQUALS)) {
+            val t = peek()
+            when {
+                t.type == TokenType.IDENTIFIER && peekNext().type == TokenType.LPAREN -> {
+                    transform = advance().value
+                    parameter = parseTransformParams().ifEmpty { null }
+                }
+                t.type == TokenType.STRING -> {
+                    transform = "copy"
+                    parameter = listOf(TransformParameter(valueString = advance().value))
+                }
+                t.type == TokenType.NUMBER -> {
+                    transform = "copy"
+                    parameter = listOf(numberParam(advance().value))
+                }
+                t.type == TokenType.IDENTIFIER -> {
+                    var path = advance().value
+                    if (check(TokenType.DOT)) {
+                        while (match(TokenType.DOT)) {
+                            path += "." + expectIdentifier("path segment")
+                        }
+                        transform = "evaluate"
+                        parameter = listOf(TransformParameter(valueString = path))
+                    } else {
+                        transform = "copy"
+                        parameter = listOf(TransformParameter(valueId = path))
+                    }
+                }
+                else -> throw IllegalArgumentException(err("Expected transform after '='"))
             }
         }
-
+        var variable: String? = null
+        if (peek().type == TokenType.AS) {
+            advance()
+            variable = expectIdentifier("variable name after 'as'")
+        }
         return StructureMapGroupRuleTarget(
             context = context,
             contextType = ContextType.VARIABLE,
-            element = element
+            element = element,
+            variable = variable,
+            transform = transform,
+            parameter = parameter
         )
+    }
+
+    private fun parseTransformParams(): List<TransformParameter> {
+        if (!match(TokenType.LPAREN)) {
+            throw IllegalArgumentException(err("Expected '(' to start parameters"))
+        }
+        val params = mutableListOf<TransformParameter>()
+        while (!check(TokenType.RPAREN)) {
+            val t = peek()
+            params.add(when (t.type) {
+                TokenType.STRING -> TransformParameter(valueString = advance().value)
+                TokenType.NUMBER -> numberParam(advance().value)
+                TokenType.IDENTIFIER -> when (t.value) {
+                    "true" -> { advance(); TransformParameter(valueBoolean = true) }
+                    "false" -> { advance(); TransformParameter(valueBoolean = false) }
+                    else -> TransformParameter(valueId = advance().value)
+                }
+                else -> throw IllegalArgumentException(err("Expected parameter"))
+            })
+            if (!check(TokenType.RPAREN) && !match(TokenType.COMMA)) {
+                throw IllegalArgumentException(err("Expected ',' between parameters"))
+            }
+        }
+        advance() // ')'
+        return params
+    }
+
+    private fun numberParam(raw: String): TransformParameter =
+        if (raw.contains('.')) TransformParameter(valueDecimal = raw.toDouble())
+        else TransformParameter(valueInteger = raw.toInt())
+
+    /**
+     * Capture a FHIRPath expression as raw-ish text: tokens joined with spaces
+     * (FHIRPath is whitespace-insensitive), strings re-quoted single. Stops at
+     * a rule boundary (->, ;, ',', as, check, then) at paren depth 0.
+     */
+    private fun captureExpression(): String {
+        val sb = StringBuilder()
+        var depth = 0
+        while (!isAtEnd()) {
+            val t = peek()
+            if (depth == 0 && (t.type == TokenType.ARROW || t.type == TokenType.SEMICOLON ||
+                    t.type == TokenType.COMMA || t.type == TokenType.AS || t.type == TokenType.CHECK ||
+                    (t.type == TokenType.IDENTIFIER && t.value == "then"))) break
+            if (t.type == TokenType.LPAREN) depth++
+            if (t.type == TokenType.RPAREN) {
+                if (depth == 0) break
+                depth--
+            }
+            if (sb.isNotEmpty()) sb.append(' ')
+            sb.append(if (t.type == TokenType.STRING) "'" + t.value + "'" else t.value)
+            advance()
+        }
+        if (sb.isEmpty()) {
+            throw IllegalArgumentException(err("Expected expression"))
+        }
+        return sb.toString()
+    }
+
+    private fun expectIdentifier(what: String): String {
+        if (peek().type != TokenType.IDENTIFIER) {
+            throw IllegalArgumentException(err("Expected $what"))
+        }
+        return advance().value
+    }
+
+    private fun peekNext(): Token =
+        if (current + 1 < tokens.size) tokens[current + 1] else tokens[tokens.size - 1]
+
+    companion object {
+        private val LIST_MODES = setOf("first", "not_first", "last", "not_last", "only_one")
     }
 
     private fun match(type: TokenType): Boolean {

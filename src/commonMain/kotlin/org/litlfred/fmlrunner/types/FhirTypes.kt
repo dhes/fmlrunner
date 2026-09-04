@@ -70,7 +70,15 @@ data class StructureMapGroupRule(
     val name: String? = null,
     val source: List<StructureMapGroupRuleSource>,
     val target: List<StructureMapGroupRuleTarget>? = null,
+    val rule: List<StructureMapGroupRule>? = null,
+    val dependent: List<StructureMapGroupRuleDependent>? = null,
     val documentation: String? = null
+)
+
+@Serializable
+data class StructureMapGroupRuleDependent(
+    val name: String,
+    val variable: List<String>
 )
 
 @Serializable
@@ -80,7 +88,11 @@ data class StructureMapGroupRuleSource(
     val variable: String? = null,
     val type: String? = null,
     val min: Int? = null,
-    val max: String? = null
+    val max: String? = null,
+    val listMode: String? = null,
+    val condition: String? = null,
+    val check: String? = null,
+    val logMessage: String? = null
 )
 
 @Serializable
@@ -90,7 +102,21 @@ data class StructureMapGroupRuleTarget(
     val element: String? = null,
     val variable: String? = null,
     val transform: String? = null,
-    val parameter: List<String>? = null
+    val parameter: List<TransformParameter>? = null,
+    val listMode: List<String>? = null
+)
+
+/**
+ * Transform parameter, FHIR R4 value[x] shape: valueId carries a variable
+ * reference, the others carry literals.
+ */
+@Serializable
+data class TransformParameter(
+    val valueId: String? = null,
+    val valueString: String? = null,
+    val valueBoolean: Boolean? = null,
+    val valueInteger: Int? = null,
+    val valueDecimal: Double? = null
 )
 
 @Serializable

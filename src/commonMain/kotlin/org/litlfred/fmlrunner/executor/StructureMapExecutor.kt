@@ -167,12 +167,12 @@ class StructureMapExecutor {
     /**
      * Apply transformation function
      */
-    private fun applyTransform(transform: String, value: JsonElement, parameters: List<String>?): JsonElement {
+    private fun applyTransform(transform: String, value: JsonElement, parameters: List<TransformParameter>?): JsonElement {
         return when (transform.lowercase()) {
             "copy" -> value
             "create" -> {
                 // Create new object/value based on parameters
-                parameters?.firstOrNull()?.let { type ->
+                parameters?.firstOrNull()?.let { p -> val type = p.valueString ?: p.valueId ?: ""
                     when (type.lowercase()) {
                         "string" -> JsonPrimitive("")
                         "integer" -> JsonPrimitive(0)
@@ -183,13 +183,13 @@ class StructureMapExecutor {
             }
             "cast" -> {
                 // Type casting
-                parameters?.firstOrNull()?.let { targetType ->
+                parameters?.firstOrNull()?.let { p -> val targetType = p.valueString ?: p.valueId ?: ""
                     castValue(value, targetType)
                 } ?: value
             }
             "evaluate" -> {
                 // Simple FHIRPath-like evaluation (basic implementation)
-                parameters?.firstOrNull()?.let { expression ->
+                parameters?.firstOrNull()?.let { p -> val expression = p.valueString ?: p.valueId ?: ""
                     evaluateExpression(value, expression)
                 } ?: value
             }
