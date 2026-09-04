@@ -1,51 +1,109 @@
 package org.litlfred.fmlrunner
 
+import kotlinx.serialization.json.*
 import java.io.File
 import kotlin.test.Test
 
 /**
  * Conformance spike: feed fmlrunner WHO smart-immunizations content verbatim
- * and report how far it gets. Fixtures from github.com/dhes/fmlrunner-conformance
- * (reference-engine oracles); FML sources from the IG's input/maps.
- *
- * Diagnostic, not pass/fail: prints a stage-by-stage ledger.
+ * and score it against the reference-engine oracles
+ * (github.com/dhes/fmlrunner-conformance). Diagnostic, not pass/fail:
+ * prints a per-fixture ledger.
  */
 class ImmzConformanceSpike {
 
     private val mapsDir = File(System.getProperty("user.home"), "projects/smart-immunizations-fresher/input/maps")
     private val fixturesDir = File(System.getProperty("user.home"), "projects/fmlrunner-conformance")
 
-    @Test
-    fun c4EndToEnd() {
+    private fun loadRunner(): FmlRunner {
         val runner = FmlRunner()
-
-        // Stage 1: compile every IMMZ FML source
-        println("=== Stage 1: compile all IMMZ FML maps ===")
-        var compiled = 0
         mapsDir.listFiles { f -> f.extension == "fml" }?.sortedBy { it.name }?.forEach { f ->
             val r = runner.compileFml(f.readText())
-            if (r.success && r.structureMap != null) {
-                runner.registerStructureMap(r.structureMap!!)
-                compiled++
-                println("COMPILE OK   ${f.name} -> ${r.structureMap!!.url}")
-            } else {
-                println("COMPILE FAIL ${f.name}: ${r.errors.take(2)}")
-            }
+            if (r.success && r.structureMap != null) runner.registerStructureMap(r.structureMap!!)
+            else println("COMPILE FAIL ${f.name}: ${r.errors.take(2)}")
         }
-        println("compiled $compiled maps")
-
-        // Stage 2: execute C4 QRToPatient on the published QR example
-        println("=== Stage 2: execute IMMZ.C4.QRToPatient on published QR ===")
-        val qr = File(fixturesDir, "package/example/QuestionnaireResponse-Example.IMMZ.C.QuestionnaireResponse.1.json").readText()
-        val exec = runner.executeStructureMap(
-            "http://smart.who.int/immunizations/StructureMap/IMMZ.C4.QRToPatient", qr
-        )
-        println("execute success=${exec.success}")
-        exec.errors.take(5).forEach { println("  error: $it") }
-        exec.warnings.take(5).forEach { println("  warning: $it") }
-        println("--- output (first 1500 chars) ---")
-        println(exec.result?.take(1500) ?: "(null result)")
-        println("--- oracle (first 600 chars, for eyeball) ---")
-        println(File(fixturesDir, "oracle/IMMZ.C4.QRToPatient__C.QuestionnaireResponse.1.json").readText().take(600))
+        File(fixturesDir, "package").listFiles { f -> f.name.startsWith("ConceptMap-") }?.forEach {
+            runner.registerConceptMap(it.readText())
+        }
+        File(fixturesDir, "package").listFiles { f -> f.name.startsWith("StructureDefinition-") }?.forEach {
+            runner.registerStructureDefinition(it.readText())
+        }
+        return runner
     }
+
+    private fun mapUrlFor(family: String): String {
+        val name = if (family == "C") "IMMZ.C4.QRToPatient" else "IMMZ.$family.QRToBundle"
+        return "http://smart.who.int/immunizations/StructureMap/$name"
+    }
+
+    @Test
+    fun scoreAllFixtures() {
+        val runner = loadRunner()
+        println("=== Conformance score: 33 fixtures vs oracle ===")
+        var match = 0; var diff = 0; var error = 0
+        File(fixturesDir, "package/example").listFiles { f ->
+            f.name.startsWith("QuestionnaireResponse-Example.IMMZ.")
+        }?.sortedBy { it.name }?.forEach { qrFile ->
+            val short = qrFile.name.removePrefix("QuestionnaireResponse-Example.IMMZ.").removeSuffix(".json")
+            val family = short.substringBefore('.')
+            val mapName = if (family == "C") "IMMZ.C4.QRToPatient" else "IMMZ.$family.QRToBundle"
+            val oracleFile = File(fixturesDir, "oracle/${mapName}__${short}.json")
+            val exec = runner.executeStructureMap(mapUrlFor(family), qrFile.readText())
+            if (!exec.success || exec.result == null) {
+                error++
+                println("ERROR $short: ${exec.errors.firstOrNull()}")
+                return@forEach
+            }
+            val ours = normalize(Json.parseToJsonElement(exec.result!!))
+            val oracle = normalize(Json.parseToJsonElement(oracleFile.readText()))
+            val divergence = firstDiff(oracle, ours, "$")
+            if (divergence == null) { match++; println("MATCH $short") }
+            else { diff++; println("DIFF  $short at $divergence") }
+        }
+        println("== score: $match match, $diff diff, $error error / 33")
+    }
+
+    // --- normalization: sequence-number UUIDs, unwrap singleton arrays ---
+
+    private val uuidRe = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+    private fun normalize(e: JsonElement): JsonElement {
+        val compact = Json.encodeToString(JsonElement.serializer(), e)
+        val seen = LinkedHashMap<String, String>()
+        val renumbered = uuidRe.replace(compact) { m ->
+            seen.getOrPut(m.value.lowercase()) { "uuid-${seen.size + 1}" }
+        }
+        return unwrap(Json.parseToJsonElement(renumbered))
+    }
+
+    private fun unwrap(e: JsonElement): JsonElement = when (e) {
+        is JsonArray -> if (e.size == 1) unwrap(e[0]) else JsonArray(e.map { unwrap(it) })
+        is JsonObject -> JsonObject(e.mapValues { unwrap(it.value) })
+        else -> e
+    }
+
+    private fun firstDiff(a: JsonElement, b: JsonElement, path: String): String? {
+        if (a::class != b::class) return "$path (kind: oracle=${a::class.simpleName} ours=${b::class.simpleName})"
+        when (a) {
+            is JsonObject -> {
+                b as JsonObject
+                for (k in a.keys + b.keys) {
+                    val av = a[k]; val bv = b[k]
+                    if (av == null) return "$path.$k (extra in ours: ${short(bv)})"
+                    if (bv == null) return "$path.$k (missing in ours; oracle=${short(av)})"
+                    firstDiff(av, bv, "$path.$k")?.let { return it }
+                }
+            }
+            is JsonArray -> {
+                b as JsonArray
+                if (a.size != b.size) return "$path (size: oracle=${a.size} ours=${b.size})"
+                a.indices.forEach { i -> firstDiff(a[i], b[i], "$path[$i]")?.let { return it } }
+            }
+            else -> if (a != b) return "$path (oracle=${short(a)} ours=${short(b)})"
+        }
+        return null
+    }
+
+    private fun short(e: JsonElement?): String =
+        (e?.toString() ?: "null").let { if (it.length > 60) it.take(60) + "…" else it }
 }
