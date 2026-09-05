@@ -11,8 +11,13 @@ import kotlin.test.Test
  */
 class NcsaConformanceSpike {
 
+    // This corpus is not published (CC BY-NC-SA content); the test skips
+    // when it is absent. Set FMLRUNNER_CONFORMANCE_NCSA_DIR to point at it.
     private val home = File(System.getProperty("user.home"))
-    private val corpus = File(home, "projects/fmlrunner-conformance-ncsa")
+    private val corpus = File(
+        System.getenv("FMLRUNNER_CONFORMANCE_NCSA_DIR")
+            ?: File(home, "projects/fmlrunner-conformance-ncsa").path
+    )
 
     private fun registerPackage(runner: FmlRunner, dir: File) {
         dir.listFiles { f -> f.name.startsWith("ConceptMap-") }?.forEach {
@@ -80,6 +85,9 @@ class NcsaConformanceSpike {
 
     @Test
     fun scoreAllFixtures() {
+        if (!corpus.isDirectory) {
+            return println("NCSA SKIPPED: corpus not found at $corpus (local-only, license-separated)")
+        }
         val runner = loadRunner()
         val all = fixtures()
         println("NCSA === Conformance score: ${all.size} fixtures vs oracle ===")

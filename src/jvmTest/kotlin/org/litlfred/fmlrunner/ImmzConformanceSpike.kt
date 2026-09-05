@@ -12,8 +12,13 @@ import kotlin.test.Test
  */
 class ImmzConformanceSpike {
 
-    private val mapsDir = File(System.getProperty("user.home"), "projects/smart-immunizations-fresher/input/maps")
-    private val fixturesDir = File(System.getProperty("user.home"), "projects/fmlrunner-conformance")
+    // Clone github.com/dhes/fmlrunner-conformance (CC0) and point
+    // FMLRUNNER_CONFORMANCE_DIR at it; the test skips when absent.
+    private val fixturesDir = File(
+        System.getenv("FMLRUNNER_CONFORMANCE_DIR")
+            ?: File(System.getProperty("user.home"), "projects/fmlrunner-conformance").path
+    )
+    private val mapsDir = File(fixturesDir, "maps")
 
     private fun loadRunner(): FmlRunner {
         val runner = FmlRunner()
@@ -33,10 +38,13 @@ class ImmzConformanceSpike {
         }
         // HL7 terminology CodeSystems the reference engine resolves via its loaded
         // terminology packages (from the local FHIR package cache)
-        File(System.getProperty("user.home"), ".fhir/packages/hl7.terminology.r4#6.2.0/package")
-            .listFiles { f -> f.name.startsWith("CodeSystem-") }?.forEach {
-                runner.registerCodeSystem(it.readText())
-            }
+        val term = File(System.getProperty("user.home"), ".fhir/packages/hl7.terminology.r4#6.2.0/package")
+        if (!term.isDirectory) {
+            println("WARN: $term missing — display lookups will diff (fetch it by running validator_cli once)")
+        }
+        term.listFiles { f -> f.name.startsWith("CodeSystem-") }?.forEach {
+            runner.registerCodeSystem(it.readText())
+        }
         return runner
     }
 
@@ -47,6 +55,10 @@ class ImmzConformanceSpike {
 
     @Test
     fun scoreAllFixtures() {
+        if (!fixturesDir.isDirectory) {
+            return println("SKIPPED: conformance corpus not found at $fixturesDir " +
+                "(clone github.com/dhes/fmlrunner-conformance or set FMLRUNNER_CONFORMANCE_DIR)")
+        }
         val runner = loadRunner()
         println("=== Conformance score: 33 fixtures vs oracle ===")
         var match = 0; var diff = 0; var error = 0
