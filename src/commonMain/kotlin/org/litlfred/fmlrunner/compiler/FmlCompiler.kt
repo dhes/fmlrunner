@@ -352,15 +352,12 @@ class FmlParser(private val tokens: List<Token>) {
             throw IllegalArgumentException(err("Expected '(' after group name"))
         }
 
-        // Parse inputs
+        // Parse inputs; the comma separator is optional (ddcc declares
+        // multiline signatures without commas)
         val inputs = mutableListOf<StructureMapGroupInput>()
         while (!check(TokenType.RPAREN)) {
             inputs.add(parseInput())
-            if (!check(TokenType.RPAREN)) {
-                if (!match(TokenType.COMMA)) {
-                    throw IllegalArgumentException(err("Expected ',' between inputs"))
-                }
-            }
+            if (!check(TokenType.RPAREN)) match(TokenType.COMMA)
         }
 
         if (!match(TokenType.RPAREN)) {
@@ -490,7 +487,12 @@ class FmlParser(private val tokens: List<Token>) {
         val context = expectIdentifier("source context")
         var element: String? = null
         if (match(TokenType.DOT)) {
-            element = expectIdentifier("element name after '.'")
+            element = expectElementName()
+        }
+        // Optional type cast: `entry.resource : Patient`
+        var type: String? = null
+        if (match(TokenType.COLON)) {
+            type = expectIdentifier("source type after ':'")
         }
         var listMode: String? = null
         var variable: String? = null
@@ -520,6 +522,7 @@ class FmlParser(private val tokens: List<Token>) {
             context = context,
             element = element,
             variable = variable,
+            type = type,
             listMode = listMode,
             condition = condition,
             check = checkExpr
@@ -543,11 +546,27 @@ class FmlParser(private val tokens: List<Token>) {
             )
         }
 
+        // Anonymous expression target: `(expr) as var` — no context, the
+        // evaluated value is only bound to the variable
+        if (peek().type == TokenType.LPAREN) {
+            val expr = captureParenExpression()
+            var variable: String? = null
+            if (peek().type == TokenType.AS) {
+                advance()
+                variable = expectIdentifier("variable name after 'as'")
+            }
+            return StructureMapGroupRuleTarget(
+                variable = variable,
+                transform = "evaluate",
+                parameter = listOf(TransformParameter(valueString = expr))
+            )
+        }
+
         // Context form: ctx('.' element)? ('=' transform)? ('as' var)?
         val context = expectIdentifier("target context")
         var element: String? = null
         if (match(TokenType.DOT)) {
-            element = expectIdentifier("element name after '.'")
+            element = expectElementName()
         }
         var transform: String? = null
         var parameter: List<TransformParameter>? = null
@@ -558,6 +577,11 @@ class FmlParser(private val tokens: List<Token>) {
                     transform = advance().value
                     parameter = parseTransformParams().ifEmpty { null }
                 }
+                // Parenthesized FHIRPath: `doseNumber = (dose.toInteger() + 1)`
+                t.type == TokenType.LPAREN -> {
+                    transform = "evaluate"
+                    parameter = listOf(TransformParameter(valueString = captureParenExpression()))
+                }
                 t.type == TokenType.STRING -> {
                     transform = "copy"
                     parameter = listOf(TransformParameter(valueString = advance().value))
@@ -565,6 +589,10 @@ class FmlParser(private val tokens: List<Token>) {
                 t.type == TokenType.NUMBER -> {
                     transform = "copy"
                     parameter = listOf(numberParam(advance().value))
+                }
+                t.type in KEYWORD_TYPES -> {
+                    transform = "copy"
+                    parameter = listOf(TransformParameter(valueId = advance().value))
                 }
                 t.type == TokenType.IDENTIFIER -> {
                     var path = advance().value
@@ -612,6 +640,9 @@ class FmlParser(private val tokens: List<Token>) {
                     "false" -> { advance(); TransformParameter(valueBoolean = false) }
                     else -> TransformParameter(valueId = advance().value)
                 }
+                // Parenthesized FHIRPath argument: evaluate(src, (($this - age)...))
+                TokenType.LPAREN -> TransformParameter(valueString = captureParenExpression())
+                in KEYWORD_TYPES -> TransformParameter(valueId = advance().value)
                 else -> throw IllegalArgumentException(err("Expected parameter"))
             })
             if (!check(TokenType.RPAREN) && !match(TokenType.COMMA)) {
@@ -655,10 +686,63 @@ class FmlParser(private val tokens: List<Token>) {
     }
 
     private fun expectIdentifier(what: String): String {
-        if (peek().type != TokenType.IDENTIFIER) {
+        if (peek().type != TokenType.IDENTIFIER && peek().type !in KEYWORD_TYPES) {
             throw IllegalArgumentException(err("Expected $what"))
         }
         return advance().value
+    }
+
+    /**
+     * Element names may be plain identifiers, FML keywords used as names
+     * (Name.prefix), or quoted strings (ICAO/DCC numeric keys: src."-260").
+     */
+    private fun expectElementName(): String {
+        val t = peek()
+        if (t.type == TokenType.IDENTIFIER || t.type == TokenType.STRING || t.type in KEYWORD_TYPES) {
+            return advance().value
+        }
+        throw IllegalArgumentException(err("Expected element name after '.'"))
+    }
+
+    /**
+     * Capture a parenthesized FHIRPath expression: consumes from the opening
+     * '(' through its matching ')', returning the inner text with spacing
+     * reconstructed (no space around '.', after '(', before ')' or ',',
+     * before a call's '(', or after '$').
+     */
+    private fun captureParenExpression(): String {
+        if (!match(TokenType.LPAREN)) {
+            throw IllegalArgumentException(err("Expected '(' to start expression"))
+        }
+        val sb = StringBuilder()
+        var depth = 1
+        var prev: Token? = null
+        while (!isAtEnd()) {
+            val t = peek()
+            if (t.type == TokenType.RPAREN) {
+                depth--
+                if (depth == 0) { advance(); break }
+            }
+            if (t.type == TokenType.LPAREN) depth++
+            if (sb.isNotEmpty() && needSpace(prev, t)) sb.append(' ')
+            sb.append(if (t.type == TokenType.STRING) "'" + t.value + "'" else t.value)
+            prev = t
+            advance()
+        }
+        if (depth != 0) {
+            throw IllegalArgumentException(err("Unbalanced parentheses in expression"))
+        }
+        return sb.toString()
+    }
+
+    private fun needSpace(prev: Token?, t: Token): Boolean {
+        if (prev == null) return false
+        if (t.type == TokenType.DOT || t.type == TokenType.COMMA || t.type == TokenType.RPAREN) return false
+        if (prev.type == TokenType.DOT || prev.type == TokenType.LPAREN) return false
+        if (t.type == TokenType.LPAREN &&
+            (prev.type == TokenType.IDENTIFIER || prev.type in KEYWORD_TYPES)) return false
+        if (prev.value == "$") return false
+        return true
     }
 
     private fun peekNext(): Token =
@@ -666,6 +750,12 @@ class FmlParser(private val tokens: List<Token>) {
 
     companion object {
         private val LIST_MODES = setOf("first", "not_first", "last", "not_last", "only_one")
+        private val KEYWORD_TYPES = setOf(
+            TokenType.MAP, TokenType.USES, TokenType.IMPORTS, TokenType.CONCEPTMAP,
+            TokenType.PREFIX, TokenType.GROUP, TokenType.INPUT, TokenType.RULE,
+            TokenType.WHERE, TokenType.CHECK, TokenType.LOG, TokenType.AS,
+            TokenType.ALIAS, TokenType.MODE
+        )
     }
 
     private fun match(type: TokenType): Boolean {
