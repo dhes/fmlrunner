@@ -28,6 +28,15 @@ class ImmzConformanceSpike {
         File(fixturesDir, "package").listFiles { f -> f.name.startsWith("StructureDefinition-") }?.forEach {
             runner.registerStructureDefinition(it.readText())
         }
+        File(fixturesDir, "package").listFiles { f -> f.name.startsWith("CodeSystem-") }?.forEach {
+            runner.registerCodeSystem(it.readText())
+        }
+        // HL7 terminology CodeSystems the reference engine resolves via its loaded
+        // terminology packages (from the local FHIR package cache)
+        File(System.getProperty("user.home"), ".fhir/packages/hl7.terminology.r4#6.2.0/package")
+            .listFiles { f -> f.name.startsWith("CodeSystem-") }?.forEach {
+                runner.registerCodeSystem(it.readText())
+            }
         return runner
     }
 

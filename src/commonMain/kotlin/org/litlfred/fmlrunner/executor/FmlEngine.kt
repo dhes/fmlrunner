@@ -24,7 +24,8 @@ data class ValidationResult(
 class FmlEngine(
     private val resolveMap: (String) -> StructureMap?,
     private val resolveConceptMap: (String) -> JsonObject? = { null },
-    private val resolveElementTypes: (String) -> Map<String, String>? = { null }
+    private val resolveElementTypes: (String) -> Map<String, String>? = { null },
+    private val resolveDisplay: (String, String) -> String? = { _, _ -> null }
 ) {
 
     // ---- mutable target tree ----
@@ -310,9 +311,14 @@ class FmlEngine(
             }))
             "uuid" -> MPrim(JsonPrimitive(randomUuid()))
             "c" -> MObj().also { o ->
-                o.append("system", MPrim(JsonPrimitive(primString(argValue(0)) ?: "")))
-                o.append("code", MPrim(JsonPrimitive(primString(argValue(1)) ?: "")))
-                if (params.size > 2) o.append("display", MPrim(JsonPrimitive(primString(argValue(2)) ?: "")))
+                val system = primString(argValue(0)) ?: ""
+                val code = primString(argValue(1)) ?: ""
+                o.append("system", MPrim(JsonPrimitive(system)))
+                o.append("code", MPrim(JsonPrimitive(code)))
+                // Display comes from terminology, matching the reference engine —
+                // the optional third argument is ignored (the reference drops
+                // displays it cannot resolve, e.g. unlicensed code systems).
+                resolveDisplay(system, code)?.let { o.append("display", MPrim(JsonPrimitive(it))) }
             }
             "translate" -> {
                 val src0 = argValue(0)

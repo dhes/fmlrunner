@@ -19,6 +19,7 @@ class FmlRunner {
     private val structureMapStore = mutableMapOf<String, StructureMap>()
     private val conceptMapStore = mutableMapOf<String, JsonObject>()
     private val typeStore = mutableMapOf<String, Map<String, String>>() // SD url -> element leaf -> type code
+    private val displayStore = mutableMapOf<String, String>() // "system|code" -> display
     
     // kotlin-fhir terminology services
     private val conceptMapService = ConceptMapService()
@@ -48,9 +49,35 @@ class FmlRunner {
         val engine = FmlEngine(
             resolveMap = { ref -> getStructureMap(ref) },
             resolveConceptMap = { url -> conceptMapStore[url] },
-            resolveElementTypes = { url -> typeStore[url] }
+            resolveElementTypes = { url -> typeStore[url] },
+            resolveDisplay = { system, code -> displayStore["$system|$code"] }
         )
         return engine.execute(structureMap, source)
+    }
+
+    /**
+     * Register a CodeSystem (JSON): concept displays back the c() transform,
+     * which resolves display from terminology (matching the reference engine)
+     * rather than from its optional third argument.
+     */
+    fun registerCodeSystem(json: String): Boolean {
+        return try {
+            val o = Json.parseToJsonElement(json) as? JsonObject ?: return false
+            val url = (o["url"] as? JsonPrimitive)?.contentOrNull ?: return false
+            fun walk(concepts: kotlinx.serialization.json.JsonArray?) {
+                concepts?.forEach { c ->
+                    val co = c as? JsonObject ?: return@forEach
+                    val code = (co["code"] as? JsonPrimitive)?.contentOrNull
+                    val display = (co["display"] as? JsonPrimitive)?.contentOrNull
+                    if (code != null && display != null) displayStore["$url|$code"] = display
+                    walk(co["concept"] as? kotlinx.serialization.json.JsonArray)
+                }
+            }
+            walk(o["concept"] as? kotlinx.serialization.json.JsonArray)
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
