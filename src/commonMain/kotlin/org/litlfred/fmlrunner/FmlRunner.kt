@@ -20,6 +20,7 @@ class FmlRunner {
     private val conceptMapStore = mutableMapOf<String, JsonObject>()
     private val typeStore = mutableMapOf<String, Map<String, String>>() // SD url -> element leaf -> type code
     private val displayStore = mutableMapOf<String, String>() // "system|code" -> display
+    private val logicalTypeNames = mutableMapOf<String, String>() // logical SD url -> resourceType name
     
     // kotlin-fhir terminology services
     private val conceptMapService = ConceptMapService()
@@ -50,7 +51,8 @@ class FmlRunner {
             resolveMap = { ref -> getStructureMap(ref) },
             resolveConceptMap = { url -> conceptMapStore[url] },
             resolveElementTypes = { url -> typeStore[url] },
-            resolveDisplay = { system, code -> displayStore["$system|$code"] }
+            resolveDisplay = { system, code -> displayStore["$system|$code"] },
+            resolveLogicalTypeName = { url -> logicalTypeNames[url] }
         )
         return engine.execute(structureMap, source)
     }
@@ -98,9 +100,19 @@ class FmlRunner {
                     ?.firstOrNull() as? JsonObject)?.get("code") as? JsonPrimitive ?: continue
                 val code = type.contentOrNull ?: continue
                 val max = (eo["max"] as? JsonPrimitive)?.contentOrNull ?: "1"
-                types[id.substringAfterLast('.')] = "$code|$max"
+                // leaf-flattened: on collisions the shallower (earlier) element
+                // wins — root-level elements precede nested ones in snapshots
+                types.getOrPut(id.substringAfterLast('.')) { "$code|$max" }
             }
             typeStore[url] = types
+            // Resource- and logical-model roots serialize with resourceType
+            // taken from the SD's `type` (its last segment), matching the
+            // reference engine; complex-type SDs get none.
+            if ((o["kind"] as? JsonPrimitive)?.contentOrNull in setOf("logical", "resource")) {
+                (o["type"] as? JsonPrimitive)?.contentOrNull?.let {
+                    logicalTypeNames[url] = it.substringAfterLast('/')
+                }
+            }
             true
         } catch (e: Exception) {
             false

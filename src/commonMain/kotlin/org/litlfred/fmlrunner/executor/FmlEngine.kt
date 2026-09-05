@@ -25,6 +25,7 @@ class FmlEngine(
     private val resolveMap: (String) -> StructureMap?,
     private val resolveConceptMap: (String) -> JsonObject? = { null },
     private val resolveElementTypes: (String) -> Map<String, String>? = { null },
+    private val resolveLogicalTypeName: (String) -> String? = { null },
     private val resolveDisplay: (String, String) -> String? = { _, _ -> null }
 ) {
 
@@ -34,6 +35,8 @@ class FmlEngine(
     class MObj : MNode() {
         /** StructureDefinition url of the type this node instantiates, when known. */
         var typeUrl: String? = null
+        /** Simple complex-type name (e.g. HumanName), when created or declared as one. */
+        var typeName: String? = null
         val fields = LinkedHashMap<String, MutableList<MNode>>()
         fun append(name: String, node: MNode, replaceIfSingular: Boolean = false) {
             val list = fields.getOrPut(name) { mutableListOf() }
@@ -50,7 +53,8 @@ class FmlEngine(
         /** FHIR repeating elements the corpus writes more than once per node. */
         val RESOURCE_TYPES = setOf(
             "Patient", "RelatedPerson", "Observation", "Immunization", "AdverseEvent",
-            "Bundle", "Practitioner", "Encounter", "Condition", "Organization"
+            "Bundle", "Practitioner", "Encounter", "Condition", "Organization",
+            "Composition", "DiagnosticReport", "Specimen"
         )
         val REPEATING_ELEMENTS = setOf(
             "entry", "extension", "identifier", "name", "telecom", "address",
@@ -94,6 +98,10 @@ class FmlEngine(
 
     /** Read child elements by name from a source-side value (choice-aware). */
     private fun readElement(v: Any, name: String): List<Any> { return when (v) {
+        // `.value` on a primitive is the primitive itself (FHIRPath's view of
+        // primitive types, e.g. `linkId.value`)
+        is JsonPrimitive -> if (name == "value") listOf(v) else emptyList()
+        is MPrim -> if (name == "value") listOf(v) else emptyList()
         is JsonObject -> {
             val exact = v[name]
             val hits = mutableListOf<JsonElement>()
@@ -131,9 +139,8 @@ class FmlEngine(
                     }
                 }
                 if (declared != null) {
-                    // complex child of a typed node: nested element leaves resolve
-                    // from the same (leaf-flattened) SD map
-                    exact.forEach { hit -> if (hit is MObj && hit.typeUrl == null) hit.typeUrl = v.typeUrl }
+                    val childUrl = childTypeUrl(declared, v.typeUrl)
+                    exact.forEach { hit -> if (hit is MObj && hit.typeUrl == null) hit.typeUrl = childUrl }
                 }
                 exact.toList()
             } else v.fields.entries
@@ -142,6 +149,24 @@ class FmlEngine(
         }
         else -> emptyList()
     } }
+
+    /**
+     * SD a declared child type resolves its own elements from: a URL names a
+     * nested model directly; a named datatype maps to its core SD; inline
+     * backbones (and primitives) stay on the parent's leaf-flattened map.
+     */
+    private fun childTypeUrl(declared: String, parentUrl: String?): String? = when {
+        declared.startsWith("http") -> declared
+        declared == "BackboneElement" || declared == "Element" -> parentUrl
+        declared.first().isUpperCase() -> "http://hl7.org/fhir/StructureDefinition/$declared"
+        else -> parentUrl
+    }
+
+    private fun typeNameOf(item: Any?): String? = when (item) {
+        is JsonObject -> (item["resourceType"] as? JsonPrimitive)?.contentOrNull
+        is MObj -> (item.fields["resourceType"]?.firstOrNull() as? MPrim)?.value?.contentOrNull
+        else -> null
+    }
 
     private fun primString(v: Any?): String? = when (v) {
         is JsonPrimitive -> v.contentOrNull
@@ -167,10 +192,17 @@ class FmlEngine(
                     }
                     InputMode.TARGET -> {
                         val root = MObj()
-                        resourceTypeForInput(map, input)?.let { root.append("resourceType", MPrim(JsonPrimitive(it))) }
+                        // The input's declared type names either a uses alias or
+                        // the last segment of a uses URL (both occur in WHO maps)
                         input.type?.let { alias ->
-                            map.structure?.firstOrNull { it.alias == alias }?.url?.let { root.typeUrl = it }
+                            map.structure?.firstOrNull {
+                                it.alias == alias || it.url.substringAfterLast('/') == alias
+                            }?.url?.let { root.typeUrl = it }
                         }
+                        resourceTypeForInput(map, input)?.let { root.append("resourceType", MPrim(JsonPrimitive(it))) }
+                            ?: root.typeUrl?.let { u ->
+                                resolveLogicalTypeName(u)?.let { root.append("resourceType", MPrim(JsonPrimitive(it))) }
+                            }
                         if (targetRoot == null) targetRoot = root
                         scope.bind(input.name, root)
                     }
@@ -204,6 +236,9 @@ class FmlEngine(
 
         val ctx = scope.lookup(src.context) ?: throw EngineError("Unknown source context '${src.context}'")
         var items: List<Any> = if (src.element != null) readElement(ctx, src.element!!) else listOf(ctx)
+
+        // Type cast (`entry.resource : Patient`) filters by resourceType
+        src.type?.let { t -> items = items.filter { typeNameOf(it) == t } }
 
         when (src.listMode) {
             null -> {}
@@ -265,6 +300,12 @@ class FmlEngine(
         if (t.context != null) {
             val node = scope.lookup(t.context!!) as? MObj
                 ?: throw EngineError("Target context '${t.context}' is not a target node")
+            if (t.element == null && t.transform == null) {
+                // Bare context target (`-> tgt` / `-> tgt as t`): names an
+                // existing node as this rule's target without mutating it
+                t.variable?.let { scope.bind(it, node) }
+                return
+            }
             var element = t.element ?: throw EngineError("Target context '${t.context}' without element")
             var placed = computed ?: MObj()
             if (computed != null && isChoiceWrite(element, node)) {
@@ -272,9 +313,21 @@ class FmlEngine(
                 element += suffix
                 placed = unwrapped
             }
-            val declaredMax = node.typeUrl
-                ?.let { resolveElementTypes(it)?.get(t.element!!) }?.substringAfter('|', "?")
-            node.append(element, placed, replaceIfSingular = computed != null || declaredMax == "1")
+            val declaredEntry = node.typeUrl?.let { resolveElementTypes(it)?.get(t.element!!) }
+            val declaredCode = declaredEntry?.substringBefore('|')
+            val declaredMax = declaredEntry?.substringAfter('|', "?")
+            // A primitive cannot be coerced into a complex-declared element
+            // (e.g. integer into Quantity); the reference drops such writes
+            if (computed is MPrim && declaredCode != null && declaredCode.first().isUpperCase()) return
+            // Carry the declared type so the child's own elements resolve from
+            // the right SD (nested logical model, named datatype, or inline
+            // backbone falling back to the parent's leaf-flattened map)
+            if (placed is MObj && placed.typeUrl == null && declaredCode != null) {
+                placed.typeUrl = childTypeUrl(declaredCode, node.typeUrl)
+            }
+            // Declared max governs replace-vs-append even for computed writes
+            val replace = if (declaredMax == "*") false else (computed != null || declaredMax == "1")
+            node.append(element, placed, replaceIfSingular = replace)
             t.variable?.let { scope.bind(it, placed) }
         } else {
             val v = computed ?: throw EngineError("Target with neither context nor transform")
@@ -303,8 +356,13 @@ class FmlEngine(
             }
             "create" -> MObj().also { o ->
                 val type = primString(argValue(0)) ?: throw EngineError("create: missing type")
-                if (type in RESOURCE_TYPES) o.append("resourceType", MPrim(JsonPrimitive(type)))
+                if (type in RESOURCE_TYPES) {
+                    o.append("resourceType", MPrim(JsonPrimitive(type)))
+                    // core SD (when registered) supplies element cardinalities
+                    o.typeUrl = "http://hl7.org/fhir/StructureDefinition/$type"
+                }
                 if (type.contains('/')) o.typeUrl = type
+                else if (type !in RESOURCE_TYPES && type.first().isUpperCase()) o.typeName = type
             }
             "append" -> MPrim(JsonPrimitive(params.indices.joinToString("") { i ->
                 primString(argValue(i)) ?: throw EngineError("append: parameter $i has no primitive value")
@@ -373,6 +431,8 @@ class FmlEngine(
                 return tag to (v.fields["value"]!!.single())
             }
         }
+        // created/declared complex-type name wins over shape heuristics
+        if (v is MObj && v.typeName != null) return v.typeName!! to v
         // Quantity shape (value + unit)
         if (v is MObj && v.fields.containsKey("value") && v.fields.containsKey("unit")) return "Quantity" to v
         // Coding shape
@@ -425,6 +485,23 @@ class FmlEngine(
 
     /** Handles `path = 'literal'` and bare `path` (existence). */
     private fun evalCondition(expr: String, focus: Any, scope: Scope): Boolean {
+        // membership: path in ('a', 'b')
+        Regex("^(.*?)\\s+in\\s*\\((.*)\\)\\s*$").find(expr)?.let { m ->
+            val values = Regex("'([^']*)'").findAll(m.groupValues[2]).map { it.groupValues[1] }.toSet()
+            return evalPath(m.groupValues[1].trim(), focus, scope).any { primString(it) in values }
+        }
+        // conjunction: A and B (top-level; corpus conditions have no nesting)
+        if (expr.contains(" and ")) {
+            return expr.split(" and ").all { evalCondition(it.trim(), focus, scope) }
+        }
+        // existence: path.exists() / path.exists().not()
+        val stripped = expr.replace(" ", "")
+        if (stripped.endsWith(".exists().not()")) {
+            return evalPath(stripped.removeSuffix(".exists().not()"), focus, scope).isEmpty()
+        }
+        if (stripped.endsWith(".exists()")) {
+            return evalPath(stripped.removeSuffix(".exists()"), focus, scope).isNotEmpty()
+        }
         val eq = expr.split('=', limit = 2)
         return if (eq.size == 2) {
             val expected = eq[1].trim().removeSurrounding("'")

@@ -38,6 +38,12 @@ class NcsaConformanceSpike {
             registerPackage(runner, File(corpus, "$repo/package"))
         }
         registerPackage(runner, File(home, ".fhir/packages/hl7.fhir.uv.shc-vaccination#1.0.0/package"))
+        // core R4 SDs supply element cardinalities (replace-vs-append on
+        // singular resource elements like Encounter.subject)
+        File(home, ".fhir/packages/hl7.fhir.r4.core#4.0.1/package")
+            .listFiles { f -> f.name.startsWith("StructureDefinition-") }?.forEach {
+                runner.registerStructureDefinition(it.readText())
+            }
         File(home, ".fhir/packages/hl7.terminology.r4#6.2.0/package")
             .listFiles { f -> f.name.startsWith("CodeSystem-") }?.forEach {
                 runner.registerCodeSystem(it.readText())
@@ -105,6 +111,12 @@ class NcsaConformanceSpike {
     private fun normalize(e: JsonElement): JsonElement {
         val compact = Json.encodeToString(JsonElement.serializer(), e)
         val seen = LinkedHashMap<String, String>()
+        // Number uuids by entry identity (fullUrl order) first, so field
+        // serialization order inside a resource cannot shift the numbering;
+        // any remaining uuids number by first appearance.
+        Regex("\"fullUrl\":\"urn:uuid:(${uuidRe.pattern})\"").findAll(compact).forEach { m ->
+            seen.getOrPut(m.groupValues[1].lowercase()) { "uuid-${seen.size + 1}" }
+        }
         val renumbered = uuidRe.replace(compact) { m ->
             seen.getOrPut(m.value.lowercase()) { "uuid-${seen.size + 1}" }
         }
