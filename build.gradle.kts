@@ -1,6 +1,7 @@
 plugins {
     kotlin("multiplatform") version "2.1.0"
     kotlin("plugin.serialization") version "2.1.0"
+    id("maven-publish")
 }
 
 group = "org.litlfred.fmlrunner"
@@ -27,6 +28,15 @@ kotlin {
         }
     }
     
+    iosArm64()
+    iosSimulatorArm64()
+    iosX64()
+
+    @OptIn(org.jetbrains.kotlin.gradle.targets.js.dsl.ExperimentalWasmDsl::class)
+    wasmJs {
+        browser()
+    }
+
     js(IR) {
         browser {
             testTask {
@@ -53,8 +63,8 @@ kotlin {
     sourceSets {
         val commonMain by getting {
             dependencies {
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0")
-                implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.4.1")
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+                implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.6.1")
                 // kotlin-fhirpath dependency from https://github.com/jingtang10/kotlin-fhirpath
                 // Note: JitPack access still blocked - will integrate when network allows
                 // implementation("com.github.jingtang10:kotlin-fhirpath:0.1.0")
