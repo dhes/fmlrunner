@@ -79,7 +79,12 @@ class FmlEngine(
                 for ((k, list) in n.fields) {
                     val items = list.mapNotNull { mToJson(it) }
                     if (items.isEmpty()) continue
-                    put(k, if (items.size == 1) items[0] else JsonArray(items))
+                    // FHIR JSON requires arrays for repeating elements even
+                    // when a single value is present
+                    val repeating = k in REPEATING_ELEMENTS ||
+                        n.typeUrl?.let { resolveElementTypes(it)?.get(k) }
+                            ?.substringAfter('|', "1") == "*"
+                    put(k, if (items.size == 1 && !repeating) items[0] else JsonArray(items))
                 }
             }
             if (o.isEmpty()) null else JsonObject(o)
